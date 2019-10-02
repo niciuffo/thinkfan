@@ -34,8 +34,6 @@ static const string kw_speed("speed");
 static const string kw_upper("upper_limit");
 static const string kw_lower("lower_limit");
 static const string kw_name("name");
-static const string kw_self(".");
-static const string kw_parent("..");
 static const string kw_indices("indices");
 static const string kw_correction("correction");
 static const string kw_optional("optional");
@@ -112,7 +110,9 @@ static int filter_hwmon_dirs(const struct dirent *entry)
 
 static int filter_subdirs(const struct dirent *entry)
 {
-	return entry->d_type & DT_DIR && entry->d_name != kw_self && entry->d_name != kw_parent;
+	return (entry->d_type & DT_DIR || entry->d_type == DT_LNK)
+		&& string(entry->d_name) != "." && string(entry->d_name) != ".."
+		&& string(entry->d_name) != "subsystem";
 }
 
 
@@ -152,6 +152,11 @@ static vector<string> find_hwmons_by_name(string path, string name, unsigned cha
 	for (int i = 0; i < nentries; i++) {
 		auto subdir = path + "/" + entries[i]->d_name;
 		free(entries[i]);
+
+		struct stat statbuf;
+		int err = stat(path.c_str(), &statbuf);
+		if (err || (statbuf.st_mode & S_IFMT) != S_IFDIR)
+			continue;
 
 		auto found = find_hwmons_by_name(subdir, name, depth + 1);
 		result.insert(result.end(), found.begin(), found.end());
@@ -213,9 +218,6 @@ static vector<wtf_ptr<T>> find_hwmons_by_indices(string path, const vector<int> 
 		free(entries);
 	}
 
-	if (!filter_indices.empty())
-		throw ConfigError("Unable to find all requested temperature inputs in " + path + ".");
-
 	return rv;
 }
 
@@ -254,10 +256,11 @@ struct convert<vector<wtf_ptr<HwmonSensorDriver>>> {
 		bool optional = node[kw_optional] ? node[kw_optional].as<bool>() : false;
 
 		if (node[kw_indices]) {
-			vector<wtf_ptr<HwmonSensorDriver>> hwmons = find_hwmons_by_indices<HwmonSensorDriver, bool>(
-						path,
-						node[kw_indices].as<vector<int>>(),
-						optional);
+			vector<int> indices = node[kw_indices].as<vector<int>>();
+			vector<wtf_ptr<HwmonSensorDriver>> hwmons = find_hwmons_by_indices<HwmonSensorDriver, bool>(path, indices, optional);
+			if (indices.size() != hwmons.size())
+				throw YamlError(get_mark_compat(node[kw_indices]), "Unable to find requested temperature inputs in " + path + ".");
+
 			if (!correction.empty()) {
 				if (correction.size() != hwmons.size())
 					throw YamlError(
@@ -414,8 +417,29 @@ struct convert<vector<wtf_ptr<HwmonFanDriver>>> {
 		auto initial_size = fans.size();
 		string path = node[kw_hwmon].as<string>();
 
-		if (node[kw_indices])
-			fans = find_hwmons_by_indices<HwmonFanDriver>(path, node[kw_indices].as<vector<int>>());
+		if (node[kw_name]) {
+			auto paths = find_hwmons_by_name(path, node[kw_name].as<string>());
+			if (paths.size() != 1) {
+				string msg;
+				if (paths.size() == 0) {
+					msg = MSG_HWMON_NOT_FOUND;
+				} else {
+					msg = MSG_MULTIPLE_HWMONS_FOUND;
+					for (string hwmon_path : paths) {
+						msg += " " + hwmon_path;
+					}
+				}
+				throw YamlError(get_mark_compat(node[kw_name]), msg);
+			}
+			path = paths[0];
+		}
+
+		if (node[kw_indices]) {
+			vector<int> indices = node[kw_indices].as<vector<int>>();
+			fans = find_hwmons_by_indices<HwmonFanDriver>(path, indices);
+			if (indices.size() != fans.size())
+				throw YamlError(get_mark_compat(node[kw_indices]), "Unable to find requested PWM controls in " + path + ".");
+		}
 		else
 			fans.push_back(make_wtf<HwmonFanDriver>(node[kw_hwmon].as<string>()));
 
